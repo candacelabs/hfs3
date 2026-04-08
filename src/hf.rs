@@ -45,6 +45,47 @@ struct HfTreeEntry {
     oid: String,
 }
 
+/// Detect the correct repo type by probing the HF API.
+///
+/// Tries model, space, then dataset in order (model is most common).
+/// Returns the first type that returns a success status, or an error
+/// if none match.
+pub async fn detect_repo_type(
+    client: &Client,
+    repo_id: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<RepoType, Hfs3Error> {
+    let candidates = [RepoType::Model, RepoType::Space, RepoType::Dataset];
+
+    for repo_type in &candidates {
+        let probe = RepoRef {
+            repo_id: repo_id.to_string(),
+            repo_type: repo_type.clone(),
+            revision: revision.to_string(),
+        };
+        let url = api_url(&probe);
+
+        let mut req = client.head(&url);
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!(repo_id, %repo_type, "auto-detected repo type");
+                return Ok(repo_type.clone());
+            }
+            _ => continue,
+        }
+    }
+
+    Err(Hfs3Error::HfApi(format!(
+        "could not detect repo type for '{}' — not found as model, space, or dataset",
+        repo_id
+    )))
+}
+
 /// List files in a HuggingFace repo via the tree API.
 ///
 /// Calls `GET /api/{models|datasets|spaces}/{repo_id}/tree/{revision}?recursive=true`,
@@ -95,7 +136,13 @@ pub async fn download_file_stream(
     repo: &RepoRef,
     file_path: &str,
     token: Option<&str>,
-) -> Result<(impl Stream<Item = Result<Bytes, reqwest::Error>>, Option<u64>), Hfs3Error> {
+) -> Result<
+    (
+        impl Stream<Item = Result<Bytes, reqwest::Error>>,
+        Option<u64>,
+    ),
+    Hfs3Error,
+> {
     let url = download_url(repo, file_path);
 
     let mut req = client.get(&url);

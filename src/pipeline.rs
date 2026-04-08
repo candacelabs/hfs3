@@ -13,10 +13,40 @@ use tokio::sync::Semaphore;
 use crate::concurrency::{chunk_size_for_transfer, plan_transfer, plan_transfer_with_memory};
 use crate::config::AppConfig;
 use crate::error::Hfs3Error;
-use crate::hf::{download_file_stream, list_repo_files};
+use crate::hf::{detect_repo_type, download_file_stream, list_repo_files};
 use crate::s3::{S3Ops, UploadParams};
 use crate::stats::{spawn_progress_reporter, CountingStream, TransferStats};
-use crate::types::{MirrorResult, PullResult, RepoRef};
+use crate::types::{MirrorResult, PullResult, RepoRef, RepoType};
+
+/// If the repo type is the default (Model), probe HF to detect the real type.
+/// Returns an owned RepoRef with the correct type.
+async fn resolve_repo_type(
+    client: &Client,
+    repo: &RepoRef,
+    token: Option<&str>,
+) -> Result<RepoRef, Hfs3Error> {
+    // Only auto-detect for bare IDs that defaulted to Model
+    if repo.repo_type == RepoType::Model {
+        match detect_repo_type(client, &repo.repo_id, &repo.revision, token).await {
+            Ok(detected) if detected != repo.repo_type => {
+                eprintln!(
+                    "Auto-detected repo type: {} (was assumed model)",
+                    detected
+                );
+                return Ok(RepoRef {
+                    repo_id: repo.repo_id.clone(),
+                    repo_type: detected,
+                    revision: repo.revision.clone(),
+                });
+            }
+            Ok(_) => {} // confirmed model, no change
+            Err(e) => {
+                tracing::warn!("repo type auto-detection failed, assuming model: {e}");
+            }
+        }
+    }
+    Ok(repo.clone())
+}
 
 /// Mirror a HuggingFace repo to S3.
 ///
@@ -33,12 +63,16 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
     let s3_ops = Arc::new(S3Ops::new(config.aws_region.as_deref()).await?);
 
     let token = config.hf_token.as_deref();
+
+    // Auto-detect repo type if the parser defaulted to Model
+    let repo = resolve_repo_type(&http_client, repo, token).await?;
+
     let repo_type_str = repo.repo_type.to_string();
     let s3_prefix = config.s3_prefix_for(&repo_type_str, &repo.repo_id);
 
     // List files from HuggingFace
     eprintln!("Listing files for {}/{} ...", repo_type_str, repo.repo_id);
-    let files = list_repo_files(&http_client, repo, token).await?;
+    let files = list_repo_files(&http_client, &repo, token).await?;
     eprintln!("Found {} files", files.len());
 
     if files.is_empty() {
