@@ -10,11 +10,31 @@ use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
+use tokio::task::JoinSet;
 
 use crate::error::Hfs3Error;
 
-// Re-export chunk_size_for_file so consumers can use it via s3 module.
-pub use crate::concurrency::chunk_size_for_file;
+// Re-export chunk functions so consumers can use them via s3 module.
+pub use crate::concurrency::{chunk_size_for_file, chunk_size_for_transfer};
+
+/// Parameters controlling how a file is uploaded to S3.
+#[derive(Debug, Clone)]
+pub struct UploadParams {
+    /// Bytes per S3 multipart part.
+    pub chunk_size: usize,
+    /// Max S3 parts uploading concurrently (1 = sequential, legacy behavior).
+    pub max_parts_in_flight: usize,
+}
+
+impl UploadParams {
+    /// Default params based only on file size (no memory awareness).
+    pub fn for_file(file_size: u64) -> Self {
+        Self {
+            chunk_size: chunk_size_for_file(file_size),
+            max_parts_in_flight: 1,
+        }
+    }
+}
 
 /// Threshold below which we use put_object instead of multipart upload.
 const PUT_OBJECT_THRESHOLD: u64 = 8 * 1024 * 1024; // 8 MB
@@ -43,6 +63,7 @@ impl S3Ops {
 
     /// Upload a byte stream to S3 using put_object (small files) or multipart upload (large files).
     ///
+    /// Uses default params (file-size-based chunks, sequential parts).
     /// Returns total bytes uploaded.
     pub async fn upload_multipart_stream(
         &self,
@@ -51,10 +72,34 @@ impl S3Ops {
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
         file_size: u64,
     ) -> Result<u64, Hfs3Error> {
+        let params = UploadParams::for_file(file_size);
+        self.upload_multipart_stream_with_progress(bucket, key, stream, file_size, &params, |_| {})
+            .await
+    }
+
+    /// Upload a byte stream with a per-part progress callback and tunable params.
+    ///
+    /// `on_part_uploaded` is called with the byte count after each S3 part
+    /// (or put_object for small files) completes successfully.
+    pub async fn upload_multipart_stream_with_progress<F>(
+        &self,
+        bucket: &str,
+        key: &str,
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+        file_size: u64,
+        params: &UploadParams,
+        on_part_uploaded: F,
+    ) -> Result<u64, Hfs3Error>
+    where
+        F: Fn(u64),
+    {
         if file_size < PUT_OBJECT_THRESHOLD {
-            self.upload_small(bucket, key, stream).await
+            let bytes = self.upload_small(bucket, key, stream).await?;
+            on_part_uploaded(bytes);
+            Ok(bytes)
         } else {
-            self.upload_multipart(bucket, key, stream, file_size).await
+            self.upload_multipart(bucket, key, stream, file_size, params, on_part_uploaded)
+                .await
         }
     }
 
@@ -87,15 +132,25 @@ impl S3Ops {
         Ok(total)
     }
 
-    /// Upload a large file using multipart upload with adaptive chunk sizing.
-    async fn upload_multipart(
+    /// Upload a large file using multipart upload with concurrent part uploads.
+    ///
+    /// Parts are buffered from the stream and uploaded via a JoinSet,
+    /// bounded by `params.max_parts_in_flight`. On error, all in-flight
+    /// uploads are aborted before the multipart upload is cancelled.
+    async fn upload_multipart<F>(
         &self,
         bucket: &str,
         key: &str,
         mut stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
-        file_size: u64,
-    ) -> Result<u64, Hfs3Error> {
-        let chunk_size = chunk_size_for_file(file_size);
+        _file_size: u64,
+        params: &UploadParams,
+        on_part_uploaded: F,
+    ) -> Result<u64, Hfs3Error>
+    where
+        F: Fn(u64),
+    {
+        let chunk_size = params.chunk_size;
+        let max_in_flight = params.max_parts_in_flight;
 
         // Create multipart upload
         let create_resp = self
@@ -112,34 +167,74 @@ impl S3Ops {
             .ok_or_else(|| Hfs3Error::S3("no upload_id returned".into()))?
             .to_string();
 
-        let mut completed_parts: Vec<CompletedPart> = Vec::new();
+        let mut completed_parts: Vec<(i32, CompletedPart)> = Vec::new();
         let mut part_number: i32 = 1;
         let mut total_bytes: u64 = 0;
         let mut buf = BytesMut::with_capacity(chunk_size);
+        let mut in_flight: JoinSet<Result<(i32, CompletedPart, u64), Hfs3Error>> = JoinSet::new();
 
-        // Buffer stream into chunk-sized parts and upload each
         let result: Result<(), Hfs3Error> = async {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(Hfs3Error::Http)?;
                 buf.extend_from_slice(&chunk);
 
                 while buf.len() >= chunk_size {
+                    // If at capacity, wait for one in-flight part to complete
+                    while in_flight.len() >= max_in_flight {
+                        if let Some(join_result) = in_flight.join_next().await {
+                            let (pnum, part, bytes) = join_result
+                                .map_err(|e| {
+                                    Hfs3Error::S3(format!("part upload task panicked: {e}"))
+                                })??;
+                            completed_parts.push((pnum, part));
+                            total_bytes += bytes;
+                            on_part_uploaded(bytes);
+                        }
+                    }
+
                     let part_data = buf.split_to(chunk_size).freeze();
                     let part_len = part_data.len() as u64;
 
-                    let part =
-                        self.upload_part(bucket, key, &upload_id, part_number, part_data)
-                            .await?;
-                    completed_parts.push(part);
+                    // Spawn concurrent part upload
+                    let client = self.client.clone();
+                    let b = bucket.to_string();
+                    let k = key.to_string();
+                    let uid = upload_id.clone();
+                    let pn = part_number;
 
-                    total_bytes += part_len;
-                    tracing::info!(
-                        bucket,
-                        key,
+                    in_flight.spawn(async move {
+                        let body = ByteStream::from(part_data);
+                        let resp = client
+                            .upload_part()
+                            .bucket(&b)
+                            .key(&k)
+                            .upload_id(&uid)
+                            .part_number(pn)
+                            .body(body)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                Hfs3Error::S3(format!("upload_part {pn} failed for {k}: {e}"))
+                            })?;
+
+                        let etag = resp
+                            .e_tag()
+                            .ok_or_else(|| Hfs3Error::S3(format!("no ETag for part {pn}")))?
+                            .to_string();
+
+                        let completed = CompletedPart::builder()
+                            .e_tag(etag)
+                            .part_number(pn)
+                            .build();
+
+                        Ok((pn, completed, part_len))
+                    });
+
+                    tracing::debug!(
                         part_number,
                         part_bytes = part_len,
-                        total_bytes,
-                        "uploaded part"
+                        in_flight = in_flight.len(),
+                        "enqueued part upload"
                     );
                     part_number += 1;
                 }
@@ -150,28 +245,60 @@ impl S3Ops {
                 let part_data = buf.freeze();
                 let part_len = part_data.len() as u64;
 
-                let part =
-                    self.upload_part(bucket, key, &upload_id, part_number, part_data)
-                        .await?;
-                completed_parts.push(part);
+                let client = self.client.clone();
+                let b = bucket.to_string();
+                let k = key.to_string();
+                let uid = upload_id.clone();
+                let pn = part_number;
 
-                total_bytes += part_len;
-                tracing::info!(
-                    bucket,
-                    key,
-                    part_number,
-                    part_bytes = part_len,
-                    total_bytes,
-                    "uploaded final part"
-                );
+                in_flight.spawn(async move {
+                    let body = ByteStream::from(part_data);
+                    let resp = client
+                        .upload_part()
+                        .bucket(&b)
+                        .key(&k)
+                        .upload_id(&uid)
+                        .part_number(pn)
+                        .body(body)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            Hfs3Error::S3(format!("upload_part {pn} failed for {k}: {e}"))
+                        })?;
+
+                    let etag = resp
+                        .e_tag()
+                        .ok_or_else(|| Hfs3Error::S3(format!("no ETag for part {pn}")))?
+                        .to_string();
+
+                    let completed = CompletedPart::builder()
+                        .e_tag(etag)
+                        .part_number(pn)
+                        .build();
+
+                    Ok((pn, completed, part_len))
+                });
+            }
+
+            // Drain all remaining in-flight parts
+            while let Some(result) = in_flight.join_next().await {
+                let (pnum, part, bytes) = result
+                    .map_err(|e| Hfs3Error::S3(format!("part upload task panicked: {e}")))??;
+                completed_parts.push((pnum, part));
+                total_bytes += bytes;
+                on_part_uploaded(bytes);
             }
 
             Ok(())
         }
         .await;
 
-        // On failure, abort the multipart upload
+        // On failure, abort all in-flight tasks then abort the multipart upload
         if let Err(e) = result {
+            in_flight.abort_all();
+            // Drain to ensure all tasks are cleaned up
+            while in_flight.join_next().await.is_some() {}
+
             tracing::warn!(
                 bucket,
                 key,
@@ -189,9 +316,29 @@ impl S3Ops {
             return Err(e);
         }
 
+        // Sort by part number (parts may complete out of order) and validate contiguity
+        completed_parts.sort_by_key(|(pnum, _)| *pnum);
+        let expected_count = (part_number - 1) as usize;
+        if completed_parts.len() != expected_count {
+            let _ = self
+                .client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            return Err(Hfs3Error::S3(format!(
+                "part count mismatch for {key}: expected {expected_count}, got {}",
+                completed_parts.len()
+            )));
+        }
+
+        let parts: Vec<CompletedPart> = completed_parts.into_iter().map(|(_, part)| part).collect();
+
         // Complete the multipart upload
         let completed = CompletedMultipartUpload::builder()
-            .set_parts(Some(completed_parts))
+            .set_parts(Some(parts))
             .build();
 
         self.client
@@ -210,47 +357,13 @@ impl S3Ops {
             bucket,
             key,
             total_bytes,
-            parts = part_number,
+            parts = part_number - 1,
+            max_in_flight,
+            chunk_size_mb = chunk_size / (1024 * 1024),
             "multipart upload complete"
         );
 
         Ok(total_bytes)
-    }
-
-    /// Upload a single part of a multipart upload.
-    async fn upload_part(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-        part_number: i32,
-        data: Bytes,
-    ) -> Result<CompletedPart, Hfs3Error> {
-        let body = ByteStream::from(data);
-
-        let resp = self
-            .client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                Hfs3Error::S3(format!("upload_part {part_number} failed for {key}: {e}"))
-            })?;
-
-        let etag = resp
-            .e_tag()
-            .ok_or_else(|| Hfs3Error::S3(format!("no ETag for part {part_number}")))?
-            .to_string();
-
-        Ok(CompletedPart::builder()
-            .e_tag(etag)
-            .part_number(part_number)
-            .build())
     }
 
     /// Download an object from S3 to a local file.

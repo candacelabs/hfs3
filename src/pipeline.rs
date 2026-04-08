@@ -5,16 +5,17 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
-use crate::concurrency::{plan_transfer, plan_transfer_with_memory};
+use crate::concurrency::{chunk_size_for_transfer, plan_transfer, plan_transfer_with_memory};
 use crate::config::AppConfig;
 use crate::error::Hfs3Error;
 use crate::hf::{download_file_stream, list_repo_files};
-use crate::s3::S3Ops;
+use crate::s3::{S3Ops, UploadParams};
+use crate::stats::{spawn_progress_reporter, CountingStream, TransferStats};
 use crate::types::{MirrorResult, PullResult, RepoRef};
 
 /// Mirror a HuggingFace repo to S3.
@@ -49,6 +50,7 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
             files_transferred: 0,
             bytes_transferred: 0,
             duration_secs: start.elapsed().as_secs_f64(),
+            stats: None,
         });
     }
 
@@ -64,18 +66,30 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
     };
 
     eprintln!(
-        "Transfer plan: max_concurrent={}, chunk_size={}MB, available_memory={}MB",
+        "Transfer plan: max_concurrent={}, chunk_size={}MB, max_parts_in_flight={}, available_memory={}MB",
         plan.max_concurrent,
         plan.chunk_size / (1024 * 1024),
+        plan.max_parts_in_flight,
         plan.available_memory / (1024 * 1024),
     );
 
+    // Initialize transfer statistics
+    let file_info: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
+    let stats = Arc::new(TransferStats::new(
+        &file_info,
+        plan.max_concurrent,
+        plan.available_memory,
+    ));
+    let reporter = spawn_progress_reporter(Arc::clone(&stats), Duration::from_secs(2));
+
     let semaphore = Arc::new(Semaphore::new(plan.max_concurrent));
     let http_client = Arc::new(http_client);
+    let available_memory = plan.available_memory;
+    let max_parts = plan.max_parts_in_flight;
 
     let mut handles = Vec::with_capacity(files.len());
 
-    for file in files {
+    for (file_idx, file) in files.into_iter().enumerate() {
         let sem = Arc::clone(&semaphore);
         let s3 = Arc::clone(&s3_ops);
         let client = Arc::clone(&http_client);
@@ -85,6 +99,7 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
         let file_path = file.path.clone();
         let repo_clone = repo.clone();
         let token_owned = config.hf_token.clone();
+        let stats_clone = Arc::clone(&stats);
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -92,23 +107,60 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
                 .await
                 .map_err(|e| Hfs3Error::S3(format!("semaphore error: {e}")))?;
 
-            eprintln!("  Uploading {} ({} bytes) -> s3://{}/{}", file_path, file_size, bucket, key);
+            // RAII guard: marks file active now, marks failed on drop unless completed
+            let guard = stats_clone.begin_file(file_idx);
 
-            let (stream, _content_length) = download_file_stream(
-                &client,
-                &repo_clone,
-                &file_path,
-                token_owned.as_deref(),
-            )
-            .await?;
+            // Per-file upload params: memory-aware chunk size + concurrent parts
+            let upload_params = UploadParams {
+                chunk_size: chunk_size_for_transfer(file_size, available_memory),
+                max_parts_in_flight: max_parts,
+            };
 
-            let bytes = s3
-                .upload_multipart_stream(&bucket, &key, stream, file_size)
-                .await?;
+            eprintln!(
+                "  Uploading {} ({} bytes, {}MB chunks, {} parts) -> s3://{}/{}",
+                file_path,
+                file_size,
+                upload_params.chunk_size / (1024 * 1024),
+                upload_params.max_parts_in_flight,
+                bucket,
+                key
+            );
 
-            eprintln!("  Done: {} ({} bytes)", file_path, bytes);
+            let result: Result<(String, u64), Hfs3Error> = async {
+                let (stream, _content_length) =
+                    download_file_stream(&client, &repo_clone, &file_path, token_owned.as_deref())
+                        .await?;
 
-            Ok::<(String, u64), Hfs3Error>((file_path, bytes))
+                // Wrap download stream to count bytes
+                let dl_stats = Arc::clone(&stats_clone);
+                let counting_stream = CountingStream::new(stream, move |n: usize| {
+                    dl_stats.add_downloaded(file_idx, n as u64);
+                });
+
+                // Upload with per-part progress callback
+                let ul_stats = Arc::clone(&stats_clone);
+                let bytes = s3
+                    .upload_multipart_stream_with_progress(
+                        &bucket,
+                        &key,
+                        counting_stream,
+                        file_size,
+                        &upload_params,
+                        move |part_bytes| ul_stats.part_uploaded(file_idx, part_bytes),
+                    )
+                    .await?;
+
+                eprintln!("  Done: {} ({} bytes)", file_path, bytes);
+                Ok((file_path, bytes))
+            }
+            .await;
+
+            if result.is_ok() {
+                guard.complete();
+            }
+            // On error, guard drops and marks file failed automatically
+
+            result
         });
 
         handles.push(handle);
@@ -133,13 +185,20 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
         }
     }
 
+    // Stop the progress reporter
+    reporter.abort();
+
     let duration = start.elapsed().as_secs_f64();
+    let stats_report = stats.report();
+
     eprintln!(
-        "Mirror complete: {}/{} files, {} bytes in {:.1}s",
+        "Mirror complete: {}/{} files, {} bytes in {:.1}s ({:.1} MB/s down, {:.1} MB/s up)",
         files_ok,
-        files_ok,
+        stats.total_files,
         total_bytes,
         duration,
+        stats_report.download_mbps,
+        stats_report.upload_mbps,
     );
 
     Ok(MirrorResult {
@@ -150,6 +209,7 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
         files_transferred: files_ok,
         bytes_transferred: total_bytes,
         duration_secs: duration,
+        stats: Some(stats_report),
     })
 }
 
@@ -211,6 +271,7 @@ mod tests {
             files_transferred: 0,
             bytes_transferred: 0,
             duration_secs: 0.0,
+            stats: None,
         };
 
         assert_eq!(result.files_transferred, 0);
@@ -257,14 +318,14 @@ mod tests {
             files_transferred: 5,
             bytes_transferred: 1024 * 1024 * 100,
             duration_secs: 12.5,
+            stats: None,
         };
 
         assert_eq!(result.files_transferred, 5);
         assert_eq!(result.bytes_transferred, 104_857_600);
 
         let json = serde_json::to_string(&result).expect("should serialize");
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).expect("should parse back");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("should parse back");
         assert_eq!(parsed["files_transferred"], 5);
         assert_eq!(parsed["bytes_transferred"], 104_857_600u64);
     }
