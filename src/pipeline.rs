@@ -114,7 +114,7 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
         plan.max_concurrent,
         plan.available_memory,
     ));
-    let reporter = spawn_progress_reporter(Arc::clone(&stats), Duration::from_secs(2));
+    let (mp, reporter) = spawn_progress_reporter(Arc::clone(&stats), Duration::from_millis(500));
 
     let semaphore = Arc::new(Semaphore::new(plan.max_concurrent));
     let http_client = Arc::new(http_client);
@@ -150,14 +150,14 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
                 max_parts_in_flight: max_parts,
             };
 
-            eprintln!(
-                "  Uploading {} ({} bytes, {}MB chunks, {} parts) -> s3://{}/{}",
-                file_path,
-                file_size,
-                upload_params.chunk_size / (1024 * 1024),
-                upload_params.max_parts_in_flight,
-                bucket,
-                key
+            tracing::debug!(
+                file = %file_path,
+                size = file_size,
+                chunk_mb = upload_params.chunk_size / (1024 * 1024),
+                max_parts = upload_params.max_parts_in_flight,
+                bucket = %bucket,
+                key = %key,
+                "starting file upload",
             );
 
             let result: Result<(String, u64), Hfs3Error> = async {
@@ -184,7 +184,6 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
                     )
                     .await?;
 
-                eprintln!("  Done: {} ({} bytes)", file_path, bytes);
                 Ok((file_path, bytes))
             }
             .await;
@@ -211,25 +210,25 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
                 total_bytes += bytes;
             }
             Ok(Err(e)) => {
-                eprintln!("  Error transferring file: {e}");
+                mp.println(format!("  ✗ Error: {e}")).ok();
             }
             Err(join_err) => {
-                eprintln!("  Task panicked: {join_err}");
+                mp.println(format!("  ✗ Task panicked: {join_err}")).ok();
             }
         }
     }
 
-    // Stop the progress reporter
-    reporter.abort();
+    // Wait for reporter to finish (self-terminates when all files done)
+    let _ = reporter.await;
 
     let duration = start.elapsed().as_secs_f64();
     let stats_report = stats.report();
 
     eprintln!(
-        "Mirror complete: {}/{} files, {} bytes in {:.1}s ({:.1} MB/s down, {:.1} MB/s up)",
+        "\n✨ Mirror complete: {}/{} files, {} in {:.1}s (↓ {:.1} MB/s  ↑ {:.1} MB/s)",
         files_ok,
         stats.total_files,
-        total_bytes,
+        crate::stats::fmt_bytes(total_bytes),
         duration,
         stats_report.download_mbps,
         stats_report.upload_mbps,

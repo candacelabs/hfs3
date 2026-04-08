@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::Stream;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
 
 use crate::concurrency::{chunk_size_for_file, chunk_size_for_transfer};
@@ -40,10 +41,6 @@ impl FileProgress {
             chunks_uploaded: AtomicUsize::new(0),
             state: AtomicUsize::new(FILE_PENDING),
         }
-    }
-
-    fn is_active(&self) -> bool {
-        self.state.load(Ordering::Relaxed) == FILE_ACTIVE
     }
 }
 
@@ -368,7 +365,7 @@ where
 
 // --- Formatting helpers ---
 
-fn fmt_bytes(bytes: u64) -> String {
+pub(crate) fn fmt_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
     const GB: u64 = 1024 * 1024 * 1024;
@@ -384,100 +381,132 @@ fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
-fn fmt_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    format!("{:02}:{:02}", secs / 60, secs % 60)
-}
-
 // --- Progress reporter ---
 
-/// Spawn a background task that prints transfer progress to stderr.
+/// Spawn a background task that renders transfer progress using indicatif.
 ///
-/// Samples process RSS and prints a summary line every `interval`.
-/// Shows per-file detail for active transfers. Self-terminates when
-/// all files are complete.
+/// Returns a `MultiProgress` handle (use `mp.println()` for messages during
+/// transfer) and a `JoinHandle` that self-terminates when all files are done.
+///
+/// The display has two bars:
+/// - Main bar: total upload progress with speeds, file count, RSS
+/// - Status bar: active file detail (name, upload progress, parts)
+///
+/// File completions and failures are printed as "✓" / "✗" lines above the bars.
 pub fn spawn_progress_reporter(
     stats: Arc<TransferStats>,
     interval: Duration,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> (MultiProgress, tokio::task::JoinHandle<()>) {
+    let mp = MultiProgress::new();
+
+    // Main progress bar — tracks total upload bytes
+    let main_bar = mp.add(ProgressBar::new(stats.total_bytes));
+    main_bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {msg}",
+        )
+        .unwrap()
+        .progress_chars("━╸─"),
+    );
+    main_bar.enable_steady_tick(Duration::from_millis(120));
+
+    // Status bar — shows active file detail below the main bar
+    let status_bar = mp.add(ProgressBar::new_spinner());
+    status_bar.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+
+    let mp_for_task = mp.clone();
+
+    let handle = tokio::spawn(async move {
+        let mut last_states = vec![FILE_PENDING; stats.total_files];
+
         loop {
             tokio::time::sleep(interval).await;
 
             stats.sample_memory();
             let snap = stats.snapshot();
 
-            let pct = if snap.total_bytes > 0 {
-                (snap.bytes_uploaded as f64 / snap.total_bytes as f64) * 100.0
+            // Update main bar
+            main_bar.set_position(snap.bytes_uploaded);
+
+            let rss = if snap.peak_rss_bytes > 0 {
+                format!("  RSS {}", fmt_bytes(snap.peak_rss_bytes))
             } else {
-                0.0
+                String::new()
             };
 
-            let rss_str = if snap.peak_rss_bytes > 0 {
-                format!(
-                    "RSS {} (peak {})",
-                    fmt_bytes(snap.mean_rss_bytes),
-                    fmt_bytes(snap.peak_rss_bytes)
-                )
-            } else {
-                "RSS N/A".to_string()
-            };
-
-            eprintln!(
-                "[{}] {}/{} files ({:.0}%) | \u{2193} {:.1} MB/s ({}) | \u{2191} {:.1} MB/s ({}) | parts {}/{} | {} workers | {}",
-                fmt_duration(snap.elapsed),
+            main_bar.set_message(format!(
+                "↓ {:.1} MB/s  ↑ {:.1} MB/s  {}/{} files  {}w{}",
+                snap.download_mbps,
+                snap.upload_mbps,
                 snap.files_completed,
                 snap.total_files,
-                pct,
-                snap.download_mbps,
-                fmt_bytes(snap.bytes_downloaded),
-                snap.upload_mbps,
-                fmt_bytes(snap.bytes_uploaded),
-                snap.chunks_uploaded,
-                snap.total_chunks,
                 snap.active_workers,
-                rss_str,
-            );
+                rss,
+            ));
 
-            // Per-file detail for active transfers
+            // Detect state transitions + build active file summaries
+            let mut active_summaries = Vec::new();
+
             for (i, fp) in stats.file_progress.iter().enumerate() {
-                if fp.is_active() {
-                    let dl = fp.bytes_downloaded.load(Ordering::Relaxed);
+                let state = fp.state.load(Ordering::Relaxed);
+
+                if state == FILE_DONE && last_states[i] != FILE_DONE {
+                    mp_for_task
+                        .println(format!(
+                            "  ✓ {} ({})",
+                            stats.file_names[i],
+                            fmt_bytes(stats.file_sizes[i]),
+                        ))
+                        .ok();
+                }
+
+                if state == FILE_FAILED && last_states[i] != FILE_FAILED {
+                    mp_for_task
+                        .println(format!("  ✗ {} failed", stats.file_names[i]))
+                        .ok();
+                }
+
+                if state == FILE_ACTIVE {
                     let ul = fp.bytes_uploaded.load(Ordering::Relaxed);
                     let fsize = stats.file_sizes[i];
-                    let pct = if fsize > 0 {
-                        (ul as f64 / fsize as f64) * 100.0
-                    } else {
-                        0.0
-                    };
+                    let parts = fp.chunks_uploaded.load(Ordering::Relaxed);
 
                     let name = &stats.file_names[i];
-                    let short = if name.len() > 45 {
-                        format!("...{}", &name[name.len() - 42..])
+                    let short = if name.len() > 25 {
+                        format!("…{}", &name[name.len() - 24..])
                     } else {
                         name.clone()
                     };
 
-                    eprintln!(
-                        "  #{:<3} {:<45} \u{2193}{:>10} \u{2191}{:>10}/{:>10} ({:.0}%) parts:{}",
-                        i,
+                    active_summaries.push(format!(
+                        "{}: ↑{}/{}  p:{}",
                         short,
-                        fmt_bytes(dl),
                         fmt_bytes(ul),
                         fmt_bytes(fsize),
-                        pct,
-                        fp.chunks_uploaded.load(Ordering::Relaxed),
-                    );
+                        parts,
+                    ));
                 }
+
+                last_states[i] = state;
             }
 
-            // Self-terminate when done
+            if active_summaries.is_empty() {
+                status_bar.set_message(String::new());
+            } else {
+                status_bar.set_message(active_summaries.join("  │  "));
+            }
+
+            // Self-terminate when all files are done
             let done = snap.files_completed + snap.files_failed;
             if done >= snap.total_files {
+                main_bar.finish_with_message("done ✓");
+                status_bar.finish_and_clear();
                 break;
             }
         }
-    })
+    });
+
+    (mp, handle)
 }
 
 // --- Tests ---
@@ -547,7 +576,7 @@ mod tests {
         let guard = stats.begin_file(0);
         assert_eq!(stats.active_workers.load(Ordering::Relaxed), 1);
         assert_eq!(stats.peak_workers.load(Ordering::Relaxed), 1);
-        assert!(stats.file_progress[0].is_active());
+        assert_eq!(stats.file_progress[0].state.load(Ordering::Relaxed), FILE_ACTIVE);
 
         guard.complete();
         assert_eq!(stats.active_workers.load(Ordering::Relaxed), 0);
@@ -696,13 +725,6 @@ mod tests {
         assert_eq!(fmt_bytes(1048576), "1.0 MB");
         assert_eq!(fmt_bytes(1073741824), "1.0 GB");
         assert_eq!(fmt_bytes(1610612736), "1.5 GB");
-    }
-
-    #[test]
-    fn test_fmt_duration() {
-        assert_eq!(fmt_duration(Duration::from_secs(0)), "00:00");
-        assert_eq!(fmt_duration(Duration::from_secs(65)), "01:05");
-        assert_eq!(fmt_duration(Duration::from_secs(3661)), "61:01");
     }
 
     #[tokio::test]
