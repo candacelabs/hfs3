@@ -381,4 +381,62 @@ mod tests {
         let prefix = config.s3_prefix_for(&repo.repo_type.to_string(), &repo.repo_id);
         assert_eq!(prefix, "hfs3-mirror/model/meta-llama--Llama-2-7b");
     }
+
+    mod resolve {
+        use super::*;
+        use wiremock::MockServer;
+
+        #[tokio::test]
+        async fn test_resolve_keeps_explicit_space_type() {
+            // If URL already parsed as Space, don't re-detect
+            let repo = RepoRef {
+                repo_id: "user/my-space".to_string(),
+                repo_type: RepoType::Space,
+                revision: "main".to_string(),
+            };
+            let client = Client::new();
+
+            // No mock server needed — should skip detection entirely
+            let resolved = resolve_repo_type(&client, &repo, None).await.unwrap();
+            assert_eq!(resolved.repo_type, RepoType::Space);
+            assert_eq!(resolved.repo_id, "user/my-space");
+        }
+
+        #[tokio::test]
+        async fn test_resolve_keeps_explicit_dataset_type() {
+            let repo = RepoRef {
+                repo_id: "org/data".to_string(),
+                repo_type: RepoType::Dataset,
+                revision: "main".to_string(),
+            };
+            let client = Client::new();
+
+            let resolved = resolve_repo_type(&client, &repo, None).await.unwrap();
+            assert_eq!(resolved.repo_type, RepoType::Dataset);
+        }
+
+        #[tokio::test]
+        async fn test_resolve_falls_back_to_model_on_detection_failure() {
+            // If detection fails (e.g. network error), keep the Model default
+            let repo = RepoRef {
+                repo_id: "org/thing".to_string(),
+                repo_type: RepoType::Model,
+                revision: "main".to_string(),
+            };
+
+            // Client pointing nowhere — all requests will fail
+            let client = Client::builder()
+                .timeout(std::time::Duration::from_millis(100))
+                .build()
+                .unwrap();
+
+            // Start a mock server with no mocks → 404 for everything.
+            // But resolve_repo_type calls detect_repo_type which uses HF_BASE,
+            // not the mock server. The detection will fail (can't reach HF),
+            // but resolve should gracefully fall back to Model.
+            let _server = MockServer::start().await;
+            let resolved = resolve_repo_type(&client, &repo, None).await.unwrap();
+            assert_eq!(resolved.repo_type, RepoType::Model);
+        }
+    }
 }

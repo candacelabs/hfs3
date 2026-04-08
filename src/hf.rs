@@ -9,6 +9,10 @@ const HF_BASE: &str = "https://huggingface.co";
 
 /// Build the HF tree API URL for listing repo files.
 fn api_url(repo: &RepoRef) -> String {
+    api_url_with_base(HF_BASE, repo)
+}
+
+fn api_url_with_base(base: &str, repo: &RepoRef) -> String {
     let type_segment = match repo.repo_type {
         RepoType::Model => "models",
         RepoType::Dataset => "datasets",
@@ -16,7 +20,7 @@ fn api_url(repo: &RepoRef) -> String {
     };
     format!(
         "{}/api/{}/{}/tree/{}?recursive=true",
-        HF_BASE, type_segment, repo.repo_id, repo.revision
+        base, type_segment, repo.repo_id, repo.revision
     )
 }
 
@@ -56,6 +60,16 @@ pub async fn detect_repo_type(
     revision: &str,
     token: Option<&str>,
 ) -> Result<RepoType, Hfs3Error> {
+    detect_repo_type_with_base(client, HF_BASE, repo_id, revision, token).await
+}
+
+async fn detect_repo_type_with_base(
+    client: &Client,
+    base_url: &str,
+    repo_id: &str,
+    revision: &str,
+    token: Option<&str>,
+) -> Result<RepoType, Hfs3Error> {
     let candidates = [RepoType::Model, RepoType::Space, RepoType::Dataset];
 
     for repo_type in &candidates {
@@ -64,7 +78,7 @@ pub async fn detect_repo_type(
             repo_type: repo_type.clone(),
             revision: revision.to_string(),
         };
-        let url = api_url(&probe);
+        let url = api_url_with_base(base_url, &probe);
 
         let mut req = client.head(&url);
         if let Some(t) = token {
@@ -228,5 +242,210 @@ mod tests {
             download_url(&repo, "app.py"),
             "https://huggingface.co/spaces/user/my-space/resolve/v2/app.py"
         );
+    }
+
+    #[test]
+    fn test_api_url_with_base_custom() {
+        let repo = model_repo();
+        assert_eq!(
+            api_url_with_base("http://localhost:1234", &repo),
+            "http://localhost:1234/api/models/meta-llama/Llama-2-7b/tree/main?recursive=true"
+        );
+    }
+
+    mod detect {
+        use super::*;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn test_detect_model() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/models/.+"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let client = Client::new();
+            let result = detect_repo_type_with_base(
+                &client,
+                &server.uri(),
+                "org/some-model",
+                "main",
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result, RepoType::Model);
+        }
+
+        #[tokio::test]
+        async fn test_detect_space_after_model_404() {
+            let server = MockServer::start().await;
+
+            // Model → 404
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/models/.+"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            // Space → 200
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/spaces/.+"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let client = Client::new();
+            let result = detect_repo_type_with_base(
+                &client,
+                &server.uri(),
+                "user/my-app",
+                "main",
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result, RepoType::Space);
+        }
+
+        #[tokio::test]
+        async fn test_detect_dataset_after_model_and_space_404() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/models/.+"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/spaces/.+"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/datasets/.+"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let client = Client::new();
+            let result = detect_repo_type_with_base(
+                &client,
+                &server.uri(),
+                "org/some-dataset",
+                "main",
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result, RepoType::Dataset);
+        }
+
+        #[tokio::test]
+        async fn test_detect_all_404_returns_error() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let client = Client::new();
+            let result = detect_repo_type_with_base(
+                &client,
+                &server.uri(),
+                "ghost/nonexistent",
+                "main",
+                None,
+            )
+            .await;
+
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("ghost/nonexistent"));
+        }
+
+        #[tokio::test]
+        async fn test_detect_sends_auth_token() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/models/.+"))
+                .and(wiremock::matchers::header("Authorization", "Bearer secret-tok"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            // Without the right token, fall through to 404
+            Mock::given(method("HEAD"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+
+            let client = Client::new();
+
+            // With token → finds model
+            let result = detect_repo_type_with_base(
+                &client,
+                &server.uri(),
+                "org/gated-model",
+                "main",
+                Some("secret-tok"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, RepoType::Model);
+
+            // Without token → all 404
+            let result = detect_repo_type_with_base(
+                &client,
+                &server.uri(),
+                "org/gated-model",
+                "main",
+                None,
+            )
+            .await;
+            assert!(result.is_err());
+        }
+
+        #[tokio::test]
+        async fn test_detect_model_wins_when_both_model_and_space_exist() {
+            let server = MockServer::start().await;
+
+            // Both model and space return 200 — model should win (tried first)
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/models/.+"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("HEAD"))
+                .and(path_regex(r"/api/spaces/.+"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let client = Client::new();
+            let result = detect_repo_type_with_base(
+                &client,
+                &server.uri(),
+                "org/ambiguous",
+                "main",
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result, RepoType::Model);
+        }
     }
 }
