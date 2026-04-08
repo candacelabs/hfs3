@@ -56,6 +56,8 @@ pub struct HfFileEntry {
     pub oid: String,
 }
 
+use crate::stats::TransferStatsReport;
+
 /// Result of a mirror operation, serialized as JSON to stdout.
 #[derive(Debug, Serialize)]
 pub struct MirrorResult {
@@ -66,6 +68,8 @@ pub struct MirrorResult {
     pub files_transferred: usize,
     pub bytes_transferred: u64,
     pub duration_secs: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<TransferStatsReport>,
 }
 
 /// Result of a pull operation, serialized as JSON to stdout.
@@ -182,8 +186,7 @@ mod tests {
 
     #[test]
     fn test_url_with_revision() {
-        let ref_ =
-            parse_repo_url("https://huggingface.co/meta-llama/Llama-2-7b/tree/dev").unwrap();
+        let ref_ = parse_repo_url("https://huggingface.co/meta-llama/Llama-2-7b/tree/dev").unwrap();
         assert_eq!(ref_.repo_id, "meta-llama/Llama-2-7b");
         assert_eq!(ref_.repo_type, RepoType::Model);
         assert_eq!(ref_.revision, "dev");

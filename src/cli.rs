@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
@@ -83,7 +83,7 @@ async fn cmd_mirror(repo_str: &str) -> Result<(), Hfs3Error> {
 }
 
 /// Pull: parse repo -> load config -> download S3 to local -> print JSON result
-async fn cmd_pull(repo_str: &str, dest: &PathBuf) -> Result<(), Hfs3Error> {
+async fn cmd_pull(repo_str: &str, dest: &Path) -> Result<(), Hfs3Error> {
     let repo = parse_repo_url(repo_str)?;
     let config = AppConfig::from_env()?;
     let result = pipeline::pull_repo(&config, &repo, dest).await?;
@@ -94,7 +94,7 @@ async fn cmd_pull(repo_str: &str, dest: &PathBuf) -> Result<(), Hfs3Error> {
 }
 
 /// Run: parse repo -> pull if needed -> docker build -> docker run -> print JSON result
-async fn cmd_run(repo_str: &str, dest: &PathBuf, port: u16, force: bool) -> Result<(), Hfs3Error> {
+async fn cmd_run(repo_str: &str, dest: &Path, port: u16, force: bool) -> Result<(), Hfs3Error> {
     let repo = parse_repo_url(repo_str)?;
     let config = AppConfig::from_env()?;
 
@@ -110,10 +110,7 @@ async fn cmd_run(repo_str: &str, dest: &PathBuf, port: u16, force: bool) -> Resu
     }
 
     // Build Docker image
-    let image_tag = format!(
-        "hfs3-{}",
-        repo.repo_id.replace('/', "-").to_lowercase()
-    );
+    let image_tag = format!("hfs3-{}", repo.repo_id.replace('/', "-").to_lowercase());
     docker::build_image(dest, &image_tag).await?;
 
     // Run Docker image

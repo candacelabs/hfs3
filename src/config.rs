@@ -24,8 +24,7 @@ impl AppConfig {
 
         Ok(Self {
             s3_bucket,
-            s3_prefix: std::env::var("HFS3_S3_PREFIX")
-                .unwrap_or_else(|_| "hfs3-mirror".into()),
+            s3_prefix: std::env::var("HFS3_S3_PREFIX").unwrap_or_else(|_| "hfs3-mirror".into()),
             hf_token: std::env::var("HF_TOKEN").ok(),
             aws_region: std::env::var("AWS_REGION").ok(),
         })
@@ -80,33 +79,39 @@ mod tests {
 
     #[test]
     fn test_from_env_minimal() {
-        with_env(&[
-            ("HFS3_S3_BUCKET", Some("my-bucket")),
-            ("HFS3_S3_PREFIX", None),
-            ("HF_TOKEN", None),
-            ("AWS_REGION", None),
-        ], || {
-            let cfg = AppConfig::from_env().unwrap();
-            assert_eq!(cfg.s3_bucket, "my-bucket");
-            assert_eq!(cfg.s3_prefix, "hfs3-mirror");
-            assert!(cfg.hf_token.is_none());
-        });
+        with_env(
+            &[
+                ("HFS3_S3_BUCKET", Some("my-bucket")),
+                ("HFS3_S3_PREFIX", None),
+                ("HF_TOKEN", None),
+                ("AWS_REGION", None),
+            ],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert_eq!(cfg.s3_bucket, "my-bucket");
+                assert_eq!(cfg.s3_prefix, "hfs3-mirror");
+                assert!(cfg.hf_token.is_none());
+            },
+        );
     }
 
     #[test]
     fn test_from_env_full() {
-        with_env(&[
-            ("HFS3_S3_BUCKET", Some("prod-bucket")),
-            ("HFS3_S3_PREFIX", Some("custom/prefix")),
-            ("HF_TOKEN", Some("hf_abc123")),
-            ("AWS_REGION", Some("us-west-2")),
-        ], || {
-            let cfg = AppConfig::from_env().unwrap();
-            assert_eq!(cfg.s3_bucket, "prod-bucket");
-            assert_eq!(cfg.s3_prefix, "custom/prefix");
-            assert_eq!(cfg.hf_token.as_deref(), Some("hf_abc123"));
-            assert_eq!(cfg.aws_region.as_deref(), Some("us-west-2"));
-        });
+        with_env(
+            &[
+                ("HFS3_S3_BUCKET", Some("prod-bucket")),
+                ("HFS3_S3_PREFIX", Some("custom/prefix")),
+                ("HF_TOKEN", Some("hf_abc123")),
+                ("AWS_REGION", Some("us-west-2")),
+            ],
+            || {
+                let cfg = AppConfig::from_env().unwrap();
+                assert_eq!(cfg.s3_bucket, "prod-bucket");
+                assert_eq!(cfg.s3_prefix, "custom/prefix");
+                assert_eq!(cfg.hf_token.as_deref(), Some("hf_abc123"));
+                assert_eq!(cfg.aws_region.as_deref(), Some("us-west-2"));
+            },
+        );
     }
 
     #[test]

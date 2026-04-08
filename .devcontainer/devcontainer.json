@@ -22,5 +22,5 @@
   "features": {
     "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
   },
-  "initializeCommand": "git clone https://github.com/kaashmonee/dotfiles /tmp/dotfiles 2>/dev/null || true"
+  "initializeCommand": "GIT_TERMINAL_PROMPT=0 git clone https://github.com/kaashmonee/dotfiles /tmp/dotfiles 2>/dev/null || true"
 }

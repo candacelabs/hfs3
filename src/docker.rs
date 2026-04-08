@@ -43,11 +43,7 @@ pub async fn build_image(context_dir: &Path, tag: &str) -> Result<(), Hfs3Error>
 /// Run a Docker image, mapping a port to localhost.
 ///
 /// Equivalent to: docker run --rm -p {port}:{port} [extra_args...] {tag}
-pub async fn run_image(
-    tag: &str,
-    port: u16,
-    extra_args: Option<&[&str]>,
-) -> Result<(), Hfs3Error> {
+pub async fn run_image(tag: &str, port: u16, extra_args: Option<&[&str]>) -> Result<(), Hfs3Error> {
     let mut cmd_args = vec![
         "run".to_string(),
         "--rm".to_string(),
@@ -61,12 +57,11 @@ pub async fn run_image(
 
     eprintln!("Running: docker {}", cmd_args.join(" "));
 
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new("docker").args(&cmd_args).status()
-    })
-    .await
-    .map_err(|e| Hfs3Error::Docker(format!("spawn error: {e}")))?
-    .map_err(|e| Hfs3Error::Docker(format!("docker run failed: {e}")))?;
+    let output =
+        tokio::task::spawn_blocking(move || Command::new("docker").args(&cmd_args).status())
+            .await
+            .map_err(|e| Hfs3Error::Docker(format!("spawn error: {e}")))?
+            .map_err(|e| Hfs3Error::Docker(format!("docker run failed: {e}")))?;
 
     if !output.success() {
         return Err(Hfs3Error::Docker(
