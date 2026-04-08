@@ -178,6 +178,19 @@ impl S3Ops {
                 let chunk = chunk.map_err(Hfs3Error::Http)?;
                 buf.extend_from_slice(&chunk);
 
+                // Eagerly collect any completed uploads (non-blocking).
+                // This keeps progress reporting responsive and frees memory
+                // from finished parts without waiting for backpressure.
+                while let Some(join_result) = in_flight.try_join_next() {
+                    let (pnum, part, bytes) = join_result
+                        .map_err(|e| {
+                            Hfs3Error::S3(format!("part upload task panicked: {e}"))
+                        })??;
+                    completed_parts.push((pnum, part));
+                    total_bytes += bytes;
+                    on_part_uploaded(bytes);
+                }
+
                 while buf.len() >= chunk_size {
                     // If at capacity, wait for one in-flight part to complete
                     while in_flight.len() >= max_in_flight {
@@ -210,6 +223,7 @@ impl S3Ops {
                             .key(&k)
                             .upload_id(&uid)
                             .part_number(pn)
+                            .content_length(part_len as i64)
                             .body(body)
                             .send()
                             .await
@@ -259,6 +273,7 @@ impl S3Ops {
                         .key(&k)
                         .upload_id(&uid)
                         .part_number(pn)
+                        .content_length(part_len as i64)
                         .body(body)
                         .send()
                         .await
