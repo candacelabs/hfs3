@@ -8,3 +8,4 @@ pub mod pipeline;
 pub mod s3;
 pub mod stats;
 pub mod types;
+pub mod xet;

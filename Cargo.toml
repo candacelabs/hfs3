@@ -23,6 +23,7 @@ futures = "0.3"
 bytes = "1"
 dotenvy = "0.15.7"
 indicatif = "0.17"
+hf-xet = "1"
 
 [dev-dependencies]
 wiremock = "0.6"

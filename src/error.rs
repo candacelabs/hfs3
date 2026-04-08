@@ -22,6 +22,9 @@ pub enum Hfs3Error {
 
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("xet error: {0}")]
+    Xet(String),
 }
 
 #[cfg(test)]
