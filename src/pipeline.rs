@@ -4,12 +4,9 @@
 //! `pull_repo` downloads all files from S3 to a local directory.
 
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
 use reqwest::Client;
 use tokio::sync::Semaphore;
 
@@ -20,7 +17,6 @@ use crate::hf::{detect_repo_type, download_file_stream, list_repo_files};
 use crate::s3::{S3Ops, UploadParams};
 use crate::stats::{spawn_progress_reporter, CountingStream, TransferStats};
 use crate::types::{MirrorResult, PullResult, RepoRef, RepoType};
-use crate::xet::XetDownloader;
 
 /// If the repo type is the default (Model), probe HF to detect the real type.
 /// Returns an owned RepoRef with the correct type.
@@ -92,28 +88,6 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
         });
     }
 
-    // Try to set up xet-core for repos that support it (opportunistic)
-    let has_xet = files.iter().any(|f| f.xet_hash.is_some());
-    let mut xet_downloader = if has_xet {
-        match XetDownloader::new(&http_client, &repo, token).await {
-            Ok(dl) => {
-                let xet_count = files.iter().filter(|f| f.xet_hash.is_some()).count();
-                eprintln!(
-                    "  xet-core enabled: {}/{} files use CAS storage",
-                    xet_count,
-                    files.len()
-                );
-                Some(dl)
-            }
-            Err(e) => {
-                eprintln!("  ⚠ xet init failed, falling back to HTTP: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // Compute transfer plan with memory-aware concurrency
     let file_refs: Vec<(&str, u64)> = files.iter().map(|f| (f.path.as_str(), f.size)).collect();
     let plan = match plan_transfer(&file_refs) {
@@ -135,12 +109,10 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
 
     // Initialize transfer statistics
     let file_info: Vec<(String, u64)> = files.iter().map(|f| (f.path.clone(), f.size)).collect();
-    let xet_flags: Vec<bool> = files.iter().map(|f| f.xet_hash.is_some()).collect();
     let stats = Arc::new(TransferStats::new(
         &file_info,
         plan.max_concurrent,
         plan.available_memory,
-        &xet_flags,
     ));
     let (mp, reporter) = spawn_progress_reporter(Arc::clone(&stats), Duration::from_millis(500));
 
@@ -152,15 +124,6 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
     let mut handles = Vec::with_capacity(files.len());
 
     for (file_idx, file) in files.into_iter().enumerate() {
-        // Refresh xet token if about to expire (best-effort, before spawning each file)
-        if file.xet_hash.is_some() {
-            if let Some(ref mut dl) = xet_downloader {
-                if let Err(e) = dl.ensure_fresh().await {
-                    eprintln!("  ⚠ xet token refresh failed: {e}");
-                }
-            }
-        }
-
         let sem = Arc::clone(&semaphore);
         let s3 = Arc::clone(&s3_ops);
         let client = Arc::clone(&http_client);
@@ -168,17 +131,9 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
         let key = format!("{}/{}", s3_prefix, file.path);
         let file_size = file.size;
         let file_path = file.path.clone();
-        let xet_hash = file.xet_hash.clone();
         let repo_clone = repo.clone();
         let token_owned = config.hf_token.clone();
         let stats_clone = Arc::clone(&stats);
-
-        // Clone the xet group for this task (cheap Arc clone)
-        let xet_group = if xet_hash.is_some() {
-            xet_downloader.as_ref().map(|dl| dl.group())
-        } else {
-            None
-        };
 
         let handle = tokio::spawn(async move {
             let _permit = sem
@@ -189,17 +144,10 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
             // RAII guard: marks file active now, marks failed on drop unless completed
             let guard = stats_clone.begin_file(file_idx);
 
-            // Per-file upload params: memory-aware chunk size + concurrent parts.
-            // Xet files get fewer in-flight parts since xet-core uses ~2GB of
-            // internal buffers for CAS reconstruction and prefetch.
-            let parts_limit = if xet_hash.is_some() {
-                max_parts.min(4)
-            } else {
-                max_parts
-            };
+            // Per-file upload params: memory-aware chunk size + concurrent parts
             let upload_params = UploadParams {
                 chunk_size: chunk_size_for_transfer(file_size, available_memory),
-                max_parts_in_flight: parts_limit,
+                max_parts_in_flight: max_parts,
             };
 
             tracing::debug!(
@@ -213,52 +161,13 @@ pub async fn mirror_repo(config: &AppConfig, repo: &RepoRef) -> Result<MirrorRes
             );
 
             let result: Result<(String, u64), Hfs3Error> = async {
-                // Branch: xet (CAS-based) or HTTP (plain download)
-                let download_stream: Pin<Box<dyn Stream<Item = Result<Bytes, Hfs3Error>> + Send>> =
-                    if let (Some(group), Some(hash)) = (&xet_group, &xet_hash) {
-                        // Xet path: chunk-based CAS download
-                        tracing::info!(file = %file_path, hash = %hash, "creating xet download stream");
-                        let info = xet::xet_session::XetFileInfo::new(hash.clone(), file_size);
-                        let xet_stream = group
-                            .download_stream(info, None)
-                            .await
-                            .map_err(|e| Hfs3Error::Xet(format!("xet download_stream failed: {e}")))?;
-                        tracing::info!(file = %file_path, "xet download stream created, starting unfold");
-                        Box::pin(futures::stream::unfold(xet_stream, |mut s| async move {
-                            match s.next().await {
-                                Ok(Some(chunk)) => {
-                                    tracing::debug!(bytes = chunk.len(), "xet chunk received");
-                                    Some((Ok(chunk), s))
-                                }
-                                Ok(None) => {
-                                    tracing::info!("xet stream complete");
-                                    None
-                                }
-                                Err(e) => {
-                                    tracing::error!(err = %e, "xet stream error");
-                                    Some((
-                                        Err(Hfs3Error::Xet(format!("xet stream error: {e}"))),
-                                        s,
-                                    ))
-                                }
-                            }
-                        }))
-                    } else {
-                        // HTTP path: plain HF file download
-                        let (stream, _content_length) =
-                            download_file_stream(
-                                &client,
-                                &repo_clone,
-                                &file_path,
-                                token_owned.as_deref(),
-                            )
-                            .await?;
-                        Box::pin(stream.map(|r| r.map_err(Hfs3Error::Http)))
-                    };
+                let (stream, _content_length) =
+                    download_file_stream(&client, &repo_clone, &file_path, token_owned.as_deref())
+                        .await?;
 
                 // Wrap download stream to count bytes
                 let dl_stats = Arc::clone(&stats_clone);
-                let counting_stream = CountingStream::new(download_stream, move |n: usize| {
+                let counting_stream = CountingStream::new(stream, move |n: usize| {
                     dl_stats.add_downloaded(file_idx, n as u64);
                 });
 

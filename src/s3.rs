@@ -9,7 +9,6 @@ use aws_sdk_s3::Client as S3Client;
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use std::path::Path;
-use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
 
@@ -39,76 +38,6 @@ impl UploadParams {
 
 /// Threshold below which we use put_object instead of multipart upload.
 const PUT_OBJECT_THRESHOLD: u64 = 8 * 1024 * 1024; // 8 MB
-
-/// Max retries for a single upload_part call.
-const UPLOAD_PART_MAX_RETRIES: u32 = 3;
-
-/// Upload a single S3 part with retry + exponential backoff.
-///
-/// Bytes is reference-counted, so cloning for retry is cheap.
-async fn upload_part_with_retry(
-    client: &S3Client,
-    bucket: &str,
-    key: &str,
-    upload_id: &str,
-    part_number: i32,
-    data: Bytes,
-) -> Result<(i32, CompletedPart, u64), Hfs3Error> {
-    let part_len = data.len() as u64;
-    let mut last_err = None;
-
-    for attempt in 0..=UPLOAD_PART_MAX_RETRIES {
-        if attempt > 0 {
-            let delay = Duration::from_secs(1 << (attempt - 1)); // 1s, 2s, 4s
-            tracing::warn!(
-                part_number,
-                attempt,
-                delay_secs = delay.as_secs(),
-                key,
-                "retrying upload_part"
-            );
-            tokio::time::sleep(delay).await;
-        }
-
-        let body = ByteStream::from(data.clone());
-        match client
-            .upload_part()
-            .bucket(bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .content_length(part_len as i64)
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                let etag = resp
-                    .e_tag()
-                    .ok_or_else(|| Hfs3Error::S3(format!("no ETag for part {part_number}")))?
-                    .to_string();
-
-                let completed = CompletedPart::builder()
-                    .e_tag(etag)
-                    .part_number(part_number)
-                    .build();
-
-                return Ok((part_number, completed, part_len));
-            }
-            Err(e) => {
-                last_err = Some(e);
-            }
-        }
-    }
-
-    Err(Hfs3Error::S3(format!(
-        "upload_part {} failed for {} after {} retries: {}",
-        part_number,
-        key,
-        UPLOAD_PART_MAX_RETRIES,
-        last_err.unwrap(),
-    )))
-}
 
 /// S3 operations wrapper around aws-sdk-s3 client.
 pub struct S3Ops {
@@ -140,7 +69,7 @@ impl S3Ops {
         &self,
         bucket: &str,
         key: &str,
-        stream: impl Stream<Item = Result<Bytes, Hfs3Error>> + Unpin,
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
         file_size: u64,
     ) -> Result<u64, Hfs3Error> {
         let params = UploadParams::for_file(file_size);
@@ -156,7 +85,7 @@ impl S3Ops {
         &self,
         bucket: &str,
         key: &str,
-        stream: impl Stream<Item = Result<Bytes, Hfs3Error>> + Unpin,
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
         file_size: u64,
         params: &UploadParams,
         on_part_uploaded: F,
@@ -179,11 +108,11 @@ impl S3Ops {
         &self,
         bucket: &str,
         key: &str,
-        mut stream: impl Stream<Item = Result<Bytes, Hfs3Error>> + Unpin,
+        mut stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
     ) -> Result<u64, Hfs3Error> {
         let mut buf = BytesMut::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = chunk.map_err(Hfs3Error::Http)?;
             buf.extend_from_slice(&chunk);
         }
         let total = buf.len() as u64;
@@ -212,7 +141,7 @@ impl S3Ops {
         &self,
         bucket: &str,
         key: &str,
-        mut stream: impl Stream<Item = Result<Bytes, Hfs3Error>> + Unpin,
+        mut stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
         _file_size: u64,
         params: &UploadParams,
         on_part_uploaded: F,
@@ -246,7 +175,7 @@ impl S3Ops {
 
         let result: Result<(), Hfs3Error> = async {
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(Hfs3Error::Http)?;
                 buf.extend_from_slice(&chunk);
 
                 // Eagerly collect any completed uploads (non-blocking).
@@ -277,8 +206,9 @@ impl S3Ops {
                     }
 
                     let part_data = buf.split_to(chunk_size).freeze();
+                    let part_len = part_data.len() as u64;
 
-                    // Spawn concurrent part upload with retry
+                    // Spawn concurrent part upload
                     let client = self.client.clone();
                     let b = bucket.to_string();
                     let k = key.to_string();
@@ -286,11 +216,37 @@ impl S3Ops {
                     let pn = part_number;
 
                     in_flight.spawn(async move {
-                        upload_part_with_retry(&client, &b, &k, &uid, pn, part_data).await
+                        let body = ByteStream::from(part_data);
+                        let resp = client
+                            .upload_part()
+                            .bucket(&b)
+                            .key(&k)
+                            .upload_id(&uid)
+                            .part_number(pn)
+                            .content_length(part_len as i64)
+                            .body(body)
+                            .send()
+                            .await
+                            .map_err(|e| {
+                                Hfs3Error::S3(format!("upload_part {pn} failed for {k}: {e}"))
+                            })?;
+
+                        let etag = resp
+                            .e_tag()
+                            .ok_or_else(|| Hfs3Error::S3(format!("no ETag for part {pn}")))?
+                            .to_string();
+
+                        let completed = CompletedPart::builder()
+                            .e_tag(etag)
+                            .part_number(pn)
+                            .build();
+
+                        Ok((pn, completed, part_len))
                     });
 
                     tracing::debug!(
                         part_number,
+                        part_bytes = part_len,
                         in_flight = in_flight.len(),
                         "enqueued part upload"
                     );
@@ -301,6 +257,7 @@ impl S3Ops {
             // Upload remaining bytes as final part
             if !buf.is_empty() {
                 let part_data = buf.freeze();
+                let part_len = part_data.len() as u64;
 
                 let client = self.client.clone();
                 let b = bucket.to_string();
@@ -309,7 +266,32 @@ impl S3Ops {
                 let pn = part_number;
 
                 in_flight.spawn(async move {
-                    upload_part_with_retry(&client, &b, &k, &uid, pn, part_data).await
+                    let body = ByteStream::from(part_data);
+                    let resp = client
+                        .upload_part()
+                        .bucket(&b)
+                        .key(&k)
+                        .upload_id(&uid)
+                        .part_number(pn)
+                        .content_length(part_len as i64)
+                        .body(body)
+                        .send()
+                        .await
+                        .map_err(|e| {
+                            Hfs3Error::S3(format!("upload_part {pn} failed for {k}: {e}"))
+                        })?;
+
+                    let etag = resp
+                        .e_tag()
+                        .ok_or_else(|| Hfs3Error::S3(format!("no ETag for part {pn}")))?
+                        .to_string();
+
+                    let completed = CompletedPart::builder()
+                        .e_tag(etag)
+                        .part_number(pn)
+                        .build();
+
+                    Ok((pn, completed, part_len))
                 });
             }
 

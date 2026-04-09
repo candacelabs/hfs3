@@ -54,9 +54,6 @@ pub struct HfFileEntry {
     pub size: u64,
     /// git object ID (sha256)
     pub oid: String,
-    /// xet merkle hash (present for xet-enabled files)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub xet_hash: Option<String>,
 }
 
 use crate::stats::TransferStatsReport;

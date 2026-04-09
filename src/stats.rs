@@ -67,7 +67,6 @@ pub struct TransferStats {
     pub file_progress: Vec<FileProgress>,
     pub file_names: Vec<String>,
     pub file_sizes: Vec<u64>,
-    pub file_is_xet: Vec<bool>,
 
     // Process RSS samples (cold path — sampled every few seconds)
     rss_samples: Mutex<Vec<u64>>,
@@ -75,15 +74,7 @@ pub struct TransferStats {
 
 impl TransferStats {
     /// Create stats for a set of files.
-    ///
-    /// `xet_flags` marks which files use xet CAS storage (same length as `files`).
-    /// Pass an empty slice if no files use xet.
-    pub fn new(
-        files: &[(String, u64)],
-        max_concurrent: usize,
-        available_memory: u64,
-        xet_flags: &[bool],
-    ) -> Self {
+    pub fn new(files: &[(String, u64)], max_concurrent: usize, available_memory: u64) -> Self {
         let total_bytes: u64 = files.iter().map(|(_, s)| *s).sum();
         let total_chunks = estimate_total_chunks(files, available_memory);
 
@@ -91,11 +82,6 @@ impl TransferStats {
             (0..files.len()).map(|_| FileProgress::new()).collect();
         let file_names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
         let file_sizes: Vec<u64> = files.iter().map(|(_, s)| *s).collect();
-        let file_is_xet: Vec<bool> = if xet_flags.len() == files.len() {
-            xet_flags.to_vec()
-        } else {
-            vec![false; files.len()]
-        };
 
         Self {
             start: Instant::now(),
@@ -113,7 +99,6 @@ impl TransferStats {
             file_progress,
             file_names,
             file_sizes,
-            file_is_xet,
             rss_samples: Mutex::new(Vec::new()),
         }
     }
@@ -482,7 +467,6 @@ pub fn spawn_progress_reporter(
                 }
 
                 if state == FILE_ACTIVE {
-                    let dl = fp.bytes_downloaded.load(Ordering::Relaxed);
                     let ul = fp.bytes_uploaded.load(Ordering::Relaxed);
                     let fsize = stats.file_sizes[i];
                     let parts = fp.chunks_uploaded.load(Ordering::Relaxed);
@@ -494,19 +478,13 @@ pub fn spawn_progress_reporter(
                         name.clone()
                     };
 
-                    let status = if stats.file_is_xet[i] && dl == 0 {
-                        format!("{}: ⏳ xet reconstructing…", short)
-                    } else {
-                        format!(
-                            "{}: ↓{} ↑{}/{}  p:{}",
-                            short,
-                            fmt_bytes(dl),
-                            fmt_bytes(ul),
-                            fmt_bytes(fsize),
-                            parts,
-                        )
-                    };
-                    active_summaries.push(status);
+                    active_summaries.push(format!(
+                        "{}: ↑{}/{}  p:{}",
+                        short,
+                        fmt_bytes(ul),
+                        fmt_bytes(fsize),
+                        parts,
+                    ));
                 }
 
                 last_states[i] = state;
@@ -580,7 +558,7 @@ mod tests {
             ("a.txt".to_string(), 1000u64),
             ("b.txt".to_string(), 2000u64),
         ];
-        let stats = TransferStats::new(&files, 4, 0, &[]);
+        let stats = TransferStats::new(&files, 4, 0);
         assert_eq!(stats.total_files, 2);
         assert_eq!(stats.total_bytes, 3000);
         assert_eq!(stats.max_concurrent, 4);
@@ -593,7 +571,7 @@ mod tests {
     #[test]
     fn test_worker_lifecycle() {
         let files = vec![("a.txt".to_string(), 1000u64)];
-        let stats = Arc::new(TransferStats::new(&files, 4, 0, &[]));
+        let stats = Arc::new(TransferStats::new(&files, 4, 0));
 
         let guard = stats.begin_file(0);
         assert_eq!(stats.active_workers.load(Ordering::Relaxed), 1);
@@ -612,7 +590,7 @@ mod tests {
     #[test]
     fn test_worker_failure_on_drop() {
         let files = vec![("a.txt".to_string(), 1000u64)];
-        let stats = Arc::new(TransferStats::new(&files, 4, 0, &[]));
+        let stats = Arc::new(TransferStats::new(&files, 4, 0));
 
         {
             let _guard = stats.begin_file(0);
@@ -629,7 +607,7 @@ mod tests {
     #[test]
     fn test_byte_tracking() {
         let files = vec![("a.txt".to_string(), 1000u64)];
-        let stats = TransferStats::new(&files, 4, 0, &[]);
+        let stats = TransferStats::new(&files, 4, 0);
 
         stats.add_downloaded(0, 500);
         stats.add_downloaded(0, 500);
@@ -659,7 +637,7 @@ mod tests {
             ("b.txt".to_string(), 2000u64),
             ("c.txt".to_string(), 3000u64),
         ];
-        let stats = Arc::new(TransferStats::new(&files, 4, 0, &[]));
+        let stats = Arc::new(TransferStats::new(&files, 4, 0));
 
         let g0 = stats.begin_file(0);
         let g1 = stats.begin_file(1);
@@ -677,7 +655,7 @@ mod tests {
     #[test]
     fn test_snapshot_rates() {
         let files = vec![("a.txt".to_string(), 1_000_000u64)];
-        let stats = TransferStats::new(&files, 4, 0, &[]);
+        let stats = TransferStats::new(&files, 4, 0);
         stats.bytes_downloaded.store(1_000_000, Ordering::Relaxed);
         stats.bytes_uploaded.store(500_000, Ordering::Relaxed);
 
@@ -691,7 +669,7 @@ mod tests {
     #[test]
     fn test_report_serializes() {
         let files = vec![("a.txt".to_string(), 1000u64)];
-        let stats = TransferStats::new(&files, 4, 0, &[]);
+        let stats = TransferStats::new(&files, 4, 0);
         let report = stats.report();
         let json = serde_json::to_string(&report).expect("report should serialize");
         assert!(json.contains("download_mbps"));
@@ -704,7 +682,7 @@ mod tests {
     #[test]
     fn test_memory_stats_empty() {
         let files = vec![("a.txt".to_string(), 1000u64)];
-        let stats = TransferStats::new(&files, 4, 0, &[]);
+        let stats = TransferStats::new(&files, 4, 0);
         let (mean, peak) = stats.memory_stats();
         assert_eq!(mean, 0);
         assert_eq!(peak, 0);
@@ -713,7 +691,7 @@ mod tests {
     #[test]
     fn test_memory_stats_with_samples() {
         let files = vec![("a.txt".to_string(), 1000u64)];
-        let stats = TransferStats::new(&files, 4, 0, &[]);
+        let stats = TransferStats::new(&files, 4, 0);
 
         {
             let mut s = stats.rss_samples.lock().unwrap();
@@ -808,28 +786,5 @@ mod tests {
         // 10 GB file -> 128 MB chunks -> ceil(10240/128) = 80
         let files = vec![("huge.safetensors".to_string(), 10 * 1024 * 1024 * 1024)];
         assert_eq!(estimate_total_chunks(&files, 0), 80);
-    }
-
-    #[test]
-    fn test_xet_flags_tracked() {
-        let files = vec![
-            ("small.txt".to_string(), 100u64),
-            ("model.safetensors".to_string(), 5_000_000_000u64),
-        ];
-        let xet_flags = vec![false, true];
-        let stats = TransferStats::new(&files, 4, 0, &xet_flags);
-        assert!(!stats.file_is_xet[0]);
-        assert!(stats.file_is_xet[1]);
-    }
-
-    #[test]
-    fn test_xet_flags_empty_defaults_to_false() {
-        let files = vec![
-            ("a.txt".to_string(), 100u64),
-            ("b.txt".to_string(), 200u64),
-        ];
-        let stats = TransferStats::new(&files, 4, 0, &[]);
-        assert!(!stats.file_is_xet[0]);
-        assert!(!stats.file_is_xet[1]);
     }
 }

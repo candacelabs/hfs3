@@ -47,9 +47,6 @@ struct HfTreeEntry {
     size: u64,
     #[serde(default)]
     oid: String,
-    /// Xet merkle hash — present for xet-enabled files.
-    #[serde(default, rename = "xetHash")]
-    xet_hash: Option<String>,
 }
 
 /// Detect the correct repo type by probing the HF API.
@@ -138,7 +135,6 @@ pub async fn list_repo_files(
             path: e.path,
             size: e.size,
             oid: e.oid,
-            xet_hash: e.xet_hash,
         })
         .collect();
 
