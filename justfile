@@ -8,7 +8,7 @@ default:
 dc +cmd:
     #!/usr/bin/env bash
     set -euo pipefail
-    devcontainer up --workspace-folder . > /dev/null 2>&1
+    devcontainer up --workspace-folder .
     # Resolve host AWS credentials and forward into the container
     eval "$(aws configure export-credentials --format env 2>/dev/null || true)"
     remote_env=()
