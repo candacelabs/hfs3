@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test in devcontainer
+        uses: devcontainers/ci@v0.3
+        with:
+          runCmd: |
+            cargo fmt -- --check
+            cargo clippy -- -D warnings
+            cargo test
